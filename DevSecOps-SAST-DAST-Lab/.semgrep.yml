@@ -1,0 +1,12 @@
+rules:
+  - id: training.sql-injection.string-interpolation
+    message: "Possible SQL injection: do not interpolate untrusted input into SQL. Use parameterized queries."
+    severity: ERROR
+    languages: [python]
+    pattern: $DB.execute(f"...")
+
+  - id: training.xss.render-template-string
+    message: "Review dynamic HTML passed to render_template_string. Prefer a template file with autoescaped variables."
+    severity: WARNING
+    languages: [python]
+    pattern: render_template_string($HTML + ...)

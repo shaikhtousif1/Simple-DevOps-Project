@@ -1,0 +1,120 @@
+name: DevSecOps Security Pipeline
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "DevSecOps-SAST-DAST-Lab/**"
+  pull_request:
+    paths:
+      - "DevSecOps-SAST-DAST-Lab/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: DevSecOps-SAST-DAST-Lab
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: DevSecOps-SAST-DAST-Lab/requirements-dev.txt
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run tests
+        run: pytest -q
+
+  sast-and-supply-chain:
+    name: SAST, secrets and SCA
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Semgrep
+        run: python -m pip install semgrep
+      - name: Semgrep SAST
+        working-directory: DevSecOps-SAST-DAST-Lab
+        run: semgrep scan --config .semgrep.yml --error app/
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Trivy filesystem scan (SCA and misconfiguration)
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          scan-type: fs
+          scan-ref: DevSecOps-SAST-DAST-Lab
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: table
+
+  container-scan:
+    name: Build and scan container image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t devsecops-lab:${{ github.sha }} DevSecOps-SAST-DAST-Lab
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: devsecops-lab:${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  dast:
+    name: OWASP ZAP DAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build and start isolated lab target
+        working-directory: DevSecOps-SAST-DAST-Lab
+        run: |
+          docker compose up --build -d
+          for attempt in $(seq 1 30); do
+            if curl --fail http://127.0.0.1:5000/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs
+          exit 1
+      - name: Run OWASP ZAP full scan against local lab only
+        run: |
+          mkdir -p DevSecOps-SAST-DAST-Lab/zap-output
+          docker run --rm --network host \
+            -v "$PWD/DevSecOps-SAST-DAST-Lab/zap-output:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py -t http://127.0.0.1:5000 \
+            -J zap-report.json -r zap-report.html -I
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-dast-reports
+          path: DevSecOps-SAST-DAST-Lab/zap-output/
+          if-no-files-found: warn
+      - name: Stop lab target
+        if: always()
+        working-directory: DevSecOps-SAST-DAST-Lab
+        run: docker compose down
